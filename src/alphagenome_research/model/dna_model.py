@@ -1163,7 +1163,7 @@ def create_model(
             trunk_embeddings, splice_site_positions, organism_index
         )
 
-    (predictions, _), _ = _forward_junctions.apply(
+    predictions, _ = _forward_junctions.apply(
         params,
         state,
         None,
