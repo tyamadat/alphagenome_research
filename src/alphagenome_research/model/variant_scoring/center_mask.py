@@ -78,39 +78,46 @@ def _apply_aggregation(
     masks: Bool[Array, 'S 1'],
     aggregation_type: variant_scorers.AggregationType,
 ):
+  """Apply aggregation and return (score, ref_agg, alt_agg)."""
   match aggregation_type:
     case variant_scorers.AggregationType.DIFF_MEAN:
-      return alt.mean(axis=0, where=masks) - ref.mean(axis=0, where=masks)
+      ref_agg = ref.mean(axis=0, where=masks)
+      alt_agg = alt.mean(axis=0, where=masks)
+      return alt_agg - ref_agg, ref_agg, alt_agg
     case variant_scorers.AggregationType.ACTIVE_MEAN:
-      return jnp.maximum(
-          alt.mean(axis=0, where=masks),
-          ref.mean(axis=0, where=masks),
-      )
+      ref_agg = ref.mean(axis=0, where=masks)
+      alt_agg = alt.mean(axis=0, where=masks)
+      return jnp.maximum(alt_agg, ref_agg), ref_agg, alt_agg
     case variant_scorers.AggregationType.DIFF_SUM:
-      return alt.sum(axis=0, where=masks) - ref.sum(axis=0, where=masks)
+      ref_agg = ref.sum(axis=0, where=masks)
+      alt_agg = alt.sum(axis=0, where=masks)
+      return alt_agg - ref_agg, ref_agg, alt_agg
     case variant_scorers.AggregationType.ACTIVE_SUM:
-      return jnp.maximum(
-          alt.sum(axis=0, where=masks),
-          ref.sum(axis=0, where=masks),
-      )
+      ref_agg = ref.sum(axis=0, where=masks)
+      alt_agg = alt.sum(axis=0, where=masks)
+      return jnp.maximum(alt_agg, ref_agg), ref_agg, alt_agg
     case variant_scorers.AggregationType.L2_DIFF:
-      return jnp.sqrt(jnp.sum((alt - ref) ** 2, axis=0, where=masks))
+      ref_agg = jnp.sqrt(jnp.sum(ref ** 2, axis=0, where=masks))
+      alt_agg = jnp.sqrt(jnp.sum(alt ** 2, axis=0, where=masks))
+      return jnp.sqrt(jnp.sum((alt - ref) ** 2, axis=0, where=masks)), ref_agg, alt_agg
     case variant_scorers.AggregationType.L2_DIFF_LOG1P:
+      ref_agg = jnp.sqrt(jnp.sum(jnp.log1p(ref) ** 2, axis=0, where=masks))
+      alt_agg = jnp.sqrt(jnp.sum(jnp.log1p(alt) ** 2, axis=0, where=masks))
       return jnp.sqrt(
           jnp.sum(
               (jnp.log1p(alt) - jnp.log1p(ref)) ** 2,
               axis=0,
               where=masks,
           )
-      )
+      ), ref_agg, alt_agg
     case variant_scorers.AggregationType.DIFF_SUM_LOG2:
-      return jnp.sum(jnp.log2(alt + 1), axis=0, where=masks) - jnp.sum(
-          jnp.log2(ref + 1), axis=0, where=masks
-      )
+      ref_agg = jnp.sum(jnp.log2(ref + 1), axis=0, where=masks)
+      alt_agg = jnp.sum(jnp.log2(alt + 1), axis=0, where=masks)
+      return alt_agg - ref_agg, ref_agg, alt_agg
     case variant_scorers.AggregationType.DIFF_LOG2_SUM:
-      return jnp.log2(1 + jnp.sum(alt, axis=0, where=masks)) - jnp.log2(
-          1 + jnp.sum(ref, axis=0, where=masks)
-      )
+      ref_agg = jnp.log2(1 + jnp.sum(ref, axis=0, where=masks))
+      alt_agg = jnp.log2(1 + jnp.sum(alt, axis=0, where=masks))
+      return alt_agg - ref_agg, ref_agg, alt_agg
     case _:
       raise ValueError(f'Unknown bin aggregation type: {aggregation_type}.')
 
@@ -152,8 +159,8 @@ class CenterMaskVariantScorer(variant_scoring.VariantScorer):
     alt = alt[settings.requested_output]
     ref = ref[settings.requested_output]
 
-    output = _apply_aggregation(ref, alt, masks, settings.aggregation_type)
-    return {'score': output}
+    score, ref_agg, alt_agg = _apply_aggregation(ref, alt, masks, settings.aggregation_type)
+    return {'score': score, 'ref': ref_agg, 'alt': alt_agg}
 
   def finalize_variant(
       self,
@@ -169,8 +176,12 @@ class CenterMaskVariantScorer(variant_scoring.VariantScorer):
     assert isinstance(output_metadata, track_data.TrackMetadata)
 
     num_tracks = len(output_metadata)
-    return variant_scoring.create_anndata(
+    adata = variant_scoring.create_anndata(
         scores['score'][np.newaxis, :num_tracks],
         obs=None,
         var=output_metadata,
     )
+    # Store REF and ALT aggregated predictions as layers
+    adata.layers['ref'] = scores['ref'][np.newaxis, :num_tracks]
+    adata.layers['alt'] = scores['alt'][np.newaxis, :num_tracks]
+    return adata

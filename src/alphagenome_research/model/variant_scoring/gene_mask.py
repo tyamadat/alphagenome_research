@@ -42,8 +42,15 @@ _VariantScorerSettings = (
 @typing.jaxtyped
 def _score_gene_variant(
     ref, alt, gene_mask, *, settings: _VariantScorerSettings
-) -> Float32[Array, 'G T']:
-  """Returns a function to score a variant given the settings."""
+):
+  """Returns a function to score a variant given the settings.
+
+  Returns:
+    Tuple of (score, ref_agg, alt_agg) where:
+    - score: The aggregated score (LFC, ACTIVE, or SPLICING)
+    - ref_agg: REF aggregated values per gene x track
+    - alt_agg: ALT aggregated values per gene x track
+  """
 
   match settings.base_variant_scorer:
     case variant_scorers.BaseVariantScorer.GENE_MASK_LFC:
@@ -52,23 +59,33 @@ def _score_gene_variant(
       gene_mask_sum = gene_mask.sum(axis=0)[:, jnp.newaxis]
       ref_mean = jnp.einsum('lt,lg->gt', ref, gene_mask) / gene_mask_sum
       alt_mean = jnp.einsum('lt,lg->gt', alt, gene_mask) / gene_mask_sum
-      return jnp.log(alt_mean + 1e-3) - jnp.log(ref_mean + 1e-3)
+      return jnp.log(alt_mean + 1e-3) - jnp.log(ref_mean + 1e-3), ref_mean, alt_mean
     case variant_scorers.BaseVariantScorer.GENE_MASK_ACTIVE:
       # Scores are the maximum of the mean prediction for REF and ALT within
       # each gene mask.
       gene_mask_sum = gene_mask.sum(axis=0)[:, jnp.newaxis]
       ref_score = jnp.einsum('lt,lg->gt', ref, gene_mask) / gene_mask_sum
       alt_score = jnp.einsum('lt,lg->gt', alt, gene_mask) / gene_mask_sum
-      return jnp.maximum(alt_score, ref_score)
+      return jnp.maximum(alt_score, ref_score), ref_score, alt_score
     case variant_scorers.BaseVariantScorer.GENE_MASK_SPLICING:
       # Scores are the maximum of the absolute difference between REF and ALT
       # within each gene mask.
       # Even for relatively small number of genes the naive implementation
       # runs out of memory. We use a map here to reduce the memory footprint.
-      return jax.lax.map(
+      # For splicing, we compute max of |diff| for score, and max of each allele separately
+      score = jax.lax.map(
           lambda mask: jnp.max(jnp.abs(alt - ref) * mask[:, None], axis=0),
           jnp.matrix_transpose(gene_mask),
       )  # shape: (G, T)
+      ref_agg = jax.lax.map(
+          lambda mask: jnp.max(jnp.abs(ref) * mask[:, None], axis=0),
+          jnp.matrix_transpose(gene_mask),
+      )
+      alt_agg = jax.lax.map(
+          lambda mask: jnp.max(jnp.abs(alt) * mask[:, None], axis=0),
+          jnp.matrix_transpose(gene_mask),
+      )
+      return score, ref_agg, alt_agg
     case _:
       raise ValueError(
           f'Unsupported base variant scorer: {settings.base_variant_scorer}.'
@@ -148,8 +165,8 @@ class GeneVariantScorer(
     gene_mask = masks
     alt = variant_scoring.align_alternate(alt, variant, interval)
 
-    output = _score_gene_variant(ref, alt, gene_mask, settings=settings)
-    return {'score': output}
+    score, ref_agg, alt_agg = _score_gene_variant(ref, alt, gene_mask, settings=settings)
+    return {'score': score, 'ref': ref_agg, 'alt': alt_agg}
 
   def finalize_variant(
       self,
@@ -167,9 +184,16 @@ class GeneVariantScorer(
         == output_metadata['strand'].values[None]
     ) | (output_metadata['strand'].values[None] == '.')
 
-    scores = np.where(strand_mask, scores['score'], np.nan)
-    return variant_scoring.create_anndata(
-        scores,
+    score_masked = np.where(strand_mask, scores['score'], np.nan)
+    ref_masked = np.where(strand_mask, scores['ref'], np.nan)
+    alt_masked = np.where(strand_mask, scores['alt'], np.nan)
+
+    adata = variant_scoring.create_anndata(
+        score_masked,
         obs=mask_metadata,
         var=output_metadata,
     )
+    # Store REF and ALT aggregated predictions as layers
+    adata.layers['ref'] = ref_masked
+    adata.layers['alt'] = alt_masked
+    return adata
